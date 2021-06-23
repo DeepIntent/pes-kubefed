@@ -1,7 +1,7 @@
 
 
 export REGISTRY=${KUBEFED_CONTAINER_REGISTRY:-harbor.central.dev.didevops.com/platform}
-export GIT_VERSION=${KUBEFED_CONTAINER_TAG:-0.7.0.pes2}
+export GIT_VERSION=${KUBEFED_CONTAINER_TAG:-0.8.0.pes1}
 
 make build container
 
