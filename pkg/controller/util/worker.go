@@ -19,10 +19,10 @@ package util
 import (
 	"time"
 
-	pkgruntime "k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/util/flowcontrol"
 	"k8s.io/client-go/util/workqueue"
+	runtimeclient "sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 type ReconcileFunc func(qualifiedName QualifiedName) ReconciliationStatus
@@ -32,10 +32,17 @@ type ReconcileWorker interface {
 	EnqueueForClusterSync(qualifiedName QualifiedName)
 	EnqueueForError(qualifiedName QualifiedName)
 	EnqueueForRetry(qualifiedName QualifiedName)
-	EnqueueObject(obj pkgruntime.Object)
+	EnqueueObject(obj runtimeclient.Object)
 	EnqueueWithDelay(qualifiedName QualifiedName, delay time.Duration)
 	Run(stopChan <-chan struct{})
 	SetDelay(retryDelay, clusterSyncDelay time.Duration)
+}
+
+type WorkerOptions struct {
+	WorkerTiming
+
+	// MaxConcurrentReconciles is the maximum number of concurrent Reconciles which can be run. Defaults to 1.
+	MaxConcurrentReconciles int
 }
 
 type WorkerTiming struct {
@@ -53,6 +60,8 @@ type asyncWorker struct {
 
 	timing WorkerTiming
 
+	maxConcurrentReconciles int
+
 	// For triggering reconciliation of a single resource. This is
 	// used when there is an add/update/delete operation on a resource
 	// in either the API of the cluster hosting KubeFed or in the API
@@ -66,26 +75,30 @@ type asyncWorker struct {
 	backoff *flowcontrol.Backoff
 }
 
-func NewReconcileWorker(name string, reconcile ReconcileFunc, timing WorkerTiming) ReconcileWorker {
-	if timing.Interval == 0 {
-		timing.Interval = time.Second * 1
+func NewReconcileWorker(name string, reconcile ReconcileFunc, options WorkerOptions) ReconcileWorker {
+	if options.Interval == 0 {
+		options.Interval = time.Second * 1
 	}
-	if timing.RetryDelay == 0 {
-		timing.RetryDelay = time.Second * 10
+	if options.RetryDelay == 0 {
+		options.RetryDelay = time.Second * 10
 	}
-	if timing.InitialBackoff == 0 {
-		timing.InitialBackoff = time.Second * 5
+	if options.InitialBackoff == 0 {
+		options.InitialBackoff = time.Second * 5
 	}
-	if timing.MaxBackoff == 0 {
-		timing.MaxBackoff = time.Minute
+	if options.MaxBackoff == 0 {
+		options.MaxBackoff = time.Minute
+	}
+	if options.MaxConcurrentReconciles == 0 {
+		options.MaxConcurrentReconciles = 1
 	}
 	return &asyncWorker{
-		name:      name,
-		reconcile: reconcile,
-		timing:    timing,
-		deliverer: NewDelayingDeliverer(),
-		queue:     workqueue.NewNamed(name),
-		backoff:   flowcontrol.NewBackOff(timing.InitialBackoff, timing.MaxBackoff),
+		name:                    name,
+		reconcile:               reconcile,
+		timing:                  options.WorkerTiming,
+		maxConcurrentReconciles: options.MaxConcurrentReconciles,
+		deliverer:               NewDelayingDeliverer(),
+		queue:                   workqueue.NewNamed(name),
+		backoff:                 flowcontrol.NewBackOff(options.InitialBackoff, options.MaxBackoff),
 	}
 }
 
@@ -105,7 +118,7 @@ func (w *asyncWorker) EnqueueForClusterSync(qualifiedName QualifiedName) {
 	w.deliver(qualifiedName, w.timing.ClusterSyncDelay, false)
 }
 
-func (w *asyncWorker) EnqueueObject(obj pkgruntime.Object) {
+func (w *asyncWorker) EnqueueObject(obj runtimeclient.Object) {
 	qualifiedName := NewQualifiedName(obj)
 	w.Enqueue(qualifiedName)
 }
@@ -122,7 +135,10 @@ func (w *asyncWorker) Run(stopChan <-chan struct{}) {
 			w.queue.Add(*qualifiedName)
 		}
 	})
-	go wait.Until(w.worker, w.timing.Interval, stopChan)
+
+	for i := 0; i < w.maxConcurrentReconciles; i++ {
+		go wait.Until(w.worker, w.timing.Interval, stopChan)
+	}
 
 	// Ensure all goroutines are cleaned up when the stop channel closes
 	go func() {

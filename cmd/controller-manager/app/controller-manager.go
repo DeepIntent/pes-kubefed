@@ -64,6 +64,8 @@ const (
 
 var (
 	kubeconfig, kubeFedConfig, masterURL, metricsAddr, healthzAddr string
+	restConfigQPS                                                  float32
+	restConfigBurst                                                int
 )
 
 // NewControllerManagerCommand creates a *cobra.Command object with default parameters
@@ -77,7 +79,7 @@ func NewControllerManagerCommand(stopChan <-chan struct{}) *cobra.Command {
 which watch KubeFed CRD's and the corresponding resources in
 member clusters and do the necessary reconciliation`,
 		Run: func(cmd *cobra.Command, args []string) {
-			fmt.Fprintf(os.Stdout, "KubeFed controller-manager version: %s\n", fmt.Sprintf("%#v", version.Get()))
+			fmt.Fprintf(os.Stdout, "KubeFed controller-manager version: %#v\n", version.Get())
 			if verFlag {
 				os.Exit(0)
 			}
@@ -98,6 +100,8 @@ member clusters and do the necessary reconciliation`,
 	flags.StringVar(&kubeFedConfig, "kubefed-config", "", "Path to a KubeFedConfig yaml file. Test only.")
 	flags.StringVar(&kubeconfig, "kubeconfig", "", "Path to a kubeconfig. Only required if out-of-cluster.")
 	flags.StringVar(&masterURL, "master", "", "The address of the Kubernetes API server. Overrides any value in kubeconfig. Only required if out-of-cluster.")
+	flags.Float32Var(&restConfigQPS, "rest-config-qps", 5.0, "Maximum QPS to the api-server from this client.")
+	flags.IntVar(&restConfigBurst, "rest-config-burst", 10, "Maximum burst for throttle to the api-server from this client.")
 
 	local := flag.NewFlagSet(os.Args[0], flag.ExitOnError)
 	klog.InitFlags(local)
@@ -120,6 +124,12 @@ func Run(opts *options.Options, stopChan <-chan struct{}) error {
 	opts.Config.KubeConfig, err = clientcmd.BuildConfigFromFlags(masterURL, kubeconfig)
 	if err != nil {
 		panic(err)
+	}
+	if restConfigQPS > 0 {
+		opts.Config.KubeConfig.QPS = restConfigQPS
+	}
+	if restConfigBurst > 0 {
+		opts.Config.KubeConfig.Burst = restConfigBurst
 	}
 
 	runningInCluster := len(masterURL) == 0 && len(kubeconfig) == 0
@@ -247,23 +257,27 @@ func setDefaultKubeFedConfigScope(fedConfig *corev1b1.KubeFedConfig) bool {
 	// Its continued existence should not be relied upon.
 	const defaultScopeEnv = "DEFAULT_KUBEFED_SCOPE"
 	defaultScope := os.Getenv(defaultScopeEnv)
-	if len(defaultScope) != 0 {
-		if defaultScope != string(apiextv1.ClusterScoped) && defaultScope != string(apiextv1.NamespaceScoped) {
-			klog.Fatalf("%s must be one of %s or %s; got %q", defaultScopeEnv,
-				string(apiextv1.ClusterScoped), string(apiextv1.NamespaceScoped), defaultScope)
-			return false
-		}
+	if len(defaultScope) == 0 {
+		return false
+	}
 
-		if len(fedConfig.Spec.Scope) == 0 {
-			fedConfig.Spec.Scope = apiextv1.ResourceScope(defaultScope)
-			klog.Infof("Setting the scope of KubeFedConfig spec to %s", defaultScope)
-			return true
-		} else if fedConfig.Spec.Scope != apiextv1.ResourceScope(defaultScope) {
-			klog.Infof("Setting the scope of KubeFedConfig spec from %s to %s",
-				string(fedConfig.Spec.Scope), defaultScope)
-			fedConfig.Spec.Scope = apiextv1.ResourceScope(defaultScope)
-			return true
-		}
+	if defaultScope != string(apiextv1.ClusterScoped) && defaultScope != string(apiextv1.NamespaceScoped) {
+		klog.Fatalf("%s must be one of %s or %s; got %q", defaultScopeEnv,
+			string(apiextv1.ClusterScoped), string(apiextv1.NamespaceScoped), defaultScope)
+		return false
+	}
+
+	if len(fedConfig.Spec.Scope) == 0 {
+		fedConfig.Spec.Scope = apiextv1.ResourceScope(defaultScope)
+		klog.Infof("Setting the scope of KubeFedConfig spec to %s", defaultScope)
+		return true
+	}
+
+	if fedConfig.Spec.Scope != apiextv1.ResourceScope(defaultScope) {
+		klog.Infof("Setting the scope of KubeFedConfig spec from %s to %s",
+			string(fedConfig.Spec.Scope), defaultScope)
+		fedConfig.Spec.Scope = apiextv1.ResourceScope(defaultScope)
+		return true
 	}
 	return false
 }
@@ -342,9 +356,8 @@ func setOptionsByKubeFedConfig(opts *options.Options) {
 	errs := validation.ValidateKubeFedConfig(fedConfig, nil)
 	if len(errs) != 0 {
 		klog.Fatalf("Error: invalid KubeFedConfig %q: %v", qualifedName, errs)
-	} else {
-		klog.Infof("Using valid KubeFedConfig %q", qualifedName)
 	}
+	klog.Infof("Using valid KubeFedConfig %q", qualifedName)
 
 	spec := fedConfig.Spec
 	opts.Scope = spec.Scope
@@ -361,6 +374,9 @@ func setOptionsByKubeFedConfig(opts *options.Options) {
 	opts.ClusterHealthCheckConfig.Timeout = spec.ClusterHealthCheck.Timeout.Duration
 	opts.ClusterHealthCheckConfig.FailureThreshold = *spec.ClusterHealthCheck.FailureThreshold
 	opts.ClusterHealthCheckConfig.SuccessThreshold = *spec.ClusterHealthCheck.SuccessThreshold
+
+	opts.Config.MaxConcurrentSyncReconciles = *spec.SyncController.MaxConcurrentReconciles
+	opts.Config.MaxConcurrentStatusReconciles = *spec.StatusController.MaxConcurrentReconciles
 
 	opts.Config.SkipAdoptingResources = *spec.SyncController.AdoptResources == corev1b1.AdoptResourcesDisabled
 

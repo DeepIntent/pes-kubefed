@@ -31,9 +31,9 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	pkgruntime "k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/rest"
 	"k8s.io/klog/v2"
+	runtimeclient "sigs.k8s.io/controller-runtime/pkg/client"
 
 	"sigs.k8s.io/kubefed/pkg/apis/core/typeconfig"
 	fedv1b1 "sigs.k8s.io/kubefed/pkg/apis/core/v1beta1"
@@ -173,7 +173,7 @@ func (j *enableType) Run(cmdOut io.Writer, config util.FedConfig) error {
 
 	if j.enableTypeOptions.outputYAML {
 		concreteTypeConfig := resources.TypeConfig.(*fedv1b1.FederatedTypeConfig)
-		objects := []pkgruntime.Object{concreteTypeConfig, resources.CRD}
+		objects := []runtimeclient.Object{concreteTypeConfig, resources.CRD}
 		err := writeObjectsToYAML(objects, cmdOut)
 		if err != nil {
 			return errors.Wrap(err, "Failed to write objects to YAML")
@@ -338,9 +338,10 @@ func CreateResources(cmdOut io.Writer, config *rest.Config, resources *typeResou
 			}
 		}
 	} else {
+		patch := runtimeclient.MergeFrom(existingTypeConfig.DeepCopy())
 		existingTypeConfig.Spec = concreteTypeConfig.Spec
 		if !dryRun {
-			err = client.Update(context.TODO(), existingTypeConfig)
+			err := client.Patch(context.TODO(), existingTypeConfig, patch)
 			if err != nil {
 				return errors.Wrapf(err, "Error updating FederatedTypeConfig %q", concreteTypeConfig.Name)
 			}
@@ -401,7 +402,7 @@ func federatedTypeCRD(typeConfig typeconfig.Interface, accessor schemaAccessor, 
 	return CrdForAPIResource(typeConfig.GetFederatedType(), schema, shortNames)
 }
 
-func writeObjectsToYAML(objects []pkgruntime.Object, w io.Writer) error {
+func writeObjectsToYAML(objects []runtimeclient.Object, w io.Writer) error {
 	for _, obj := range objects {
 		if _, err := w.Write([]byte("---\n")); err != nil {
 			return errors.Wrap(err, "Error encoding object to yaml")
@@ -414,7 +415,7 @@ func writeObjectsToYAML(objects []pkgruntime.Object, w io.Writer) error {
 	return nil
 }
 
-func writeObjectToYAML(obj pkgruntime.Object, w io.Writer) error {
+func writeObjectToYAML(obj runtimeclient.Object, w io.Writer) error {
 	json, err := jsoniter.ConfigCompatibleWithStandardLibrary.Marshal(obj)
 	if err != nil {
 		return err

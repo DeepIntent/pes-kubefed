@@ -28,7 +28,6 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	pkgruntime "k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/sets"
@@ -39,7 +38,7 @@ import (
 	"k8s.io/client-go/tools/record"
 	"k8s.io/klog/v2"
 
-	"sigs.k8s.io/controller-runtime/pkg/client"
+	runtimeclient "sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	"sigs.k8s.io/kubefed/pkg/apis/core/typeconfig"
@@ -132,8 +131,11 @@ func newKubeFedSyncController(controllerConfig *util.ControllerConfig, typeConfi
 		rawResourceStatusCollection: controllerConfig.RawResourceStatusCollection,
 	}
 
-	s.worker = util.NewReconcileWorker(strings.ToLower(federatedTypeAPIResource.Kind), s.reconcile, util.WorkerTiming{
-		ClusterSyncDelay: s.clusterAvailableDelay,
+	s.worker = util.NewReconcileWorker(strings.ToLower(federatedTypeAPIResource.Kind), s.reconcile, util.WorkerOptions{
+		WorkerTiming: util.WorkerTiming{
+			ClusterSyncDelay: s.clusterAvailableDelay,
+		},
+		MaxConcurrentReconciles: int(controllerConfig.MaxConcurrentSyncReconciles),
 	})
 
 	// Build deliverer for triggering cluster reconciliations.
@@ -147,7 +149,7 @@ func newKubeFedSyncController(controllerConfig *util.ControllerConfig, typeConfi
 		controllerConfig,
 		client,
 		&targetAPIResource,
-		func(obj pkgruntime.Object) {
+		func(obj runtimeclient.Object) {
 			qualifiedName := util.NewQualifiedName(obj)
 			s.worker.EnqueueForRetry(qualifiedName)
 		},
@@ -232,7 +234,7 @@ func (s *KubeFedSyncController) reconcileOnClusterChange() {
 		s.clusterDeliverer.DeliverAt(allClustersKey, nil, time.Now().Add(s.clusterAvailableDelay))
 	}
 	s.fedAccessor.VisitFederatedResources(func(obj interface{}) {
-		qualifiedName := util.NewQualifiedName(obj.(pkgruntime.Object))
+		qualifiedName := util.NewQualifiedName(obj.(runtimeclient.Object))
 		s.worker.EnqueueWithDelay(qualifiedName, s.smallDelay)
 	})
 }
@@ -281,6 +283,7 @@ func (s *KubeFedSyncController) reconcile(qualifiedName util.QualifiedName) util
 	err = s.ensureFinalizer(fedResource)
 	if err != nil {
 		fedResource.RecordError("EnsureFinalizerError", errors.Wrap(err, "Failed to ensure finalizer"))
+		runtime.HandleError(errors.Wrapf(err, "failed to ensure finalizer"))
 		return util.StatusError
 	}
 
@@ -297,12 +300,14 @@ func (s *KubeFedSyncController) syncToClusters(fedResource FederatedResource) ut
 	clusters, err := s.informer.GetClusters()
 	if err != nil {
 		fedResource.RecordError(string(status.ClusterRetrievalFailed), errors.Wrap(err, "Failed to retrieve list of clusters"))
+		runtime.HandleError(errors.Wrapf(err, "failed to retrieve list of clusters"))
 		return s.setFederatedStatus(fedResource, status.ClusterRetrievalFailed, nil, nil, enableRawResourceStatusCollection)
 	}
 
 	selectedClusterNames, err := fedResource.ComputePlacement(clusters)
 	if err != nil {
 		fedResource.RecordError(string(status.ComputePlacementFailed), errors.Wrap(err, "Failed to compute placement"))
+		runtime.HandleError(errors.Wrapf(err, "failed to compute placement"))
 		return s.setFederatedStatus(fedResource, status.ComputePlacementFailed, nil, nil, enableRawResourceStatusCollection)
 	}
 
@@ -374,8 +379,8 @@ func (s *KubeFedSyncController) syncToClusters(fedResource FederatedResource) ut
 	_, timeoutErr := dispatcher.Wait()
 	if timeoutErr != nil {
 		fedResource.RecordError("OperationTimeoutError", timeoutErr)
+		runtime.HandleError(errors.Wrapf(timeoutErr, "operation timeout"))
 	}
-
 	// Write updated versions to the API.
 	updatedVersionMap := dispatcher.VersionMap()
 	err = fedResource.UpdateVersions(selectedClusterNames.List(), updatedVersionMap)
@@ -523,7 +528,7 @@ func (s *KubeFedSyncController) removeManagedLabel(gvk schema.GroupVersionKind, 
 	return nil
 }
 
-func (s *KubeFedSyncController) deleteFromClusters(fedResource FederatedResource, opts ...client.DeleteOption) (bool, error) {
+func (s *KubeFedSyncController) deleteFromClusters(fedResource FederatedResource, opts ...runtimeclient.DeleteOption) (bool, error) {
 	gvk := fedResource.TargetGVK()
 	qualifiedName := fedResource.TargetName()
 
@@ -661,7 +666,7 @@ func (s *KubeFedSyncController) ensureFinalizer(fedResource FederatedResource) e
 		return nil
 	}
 
-	patch := client.MergeFrom(obj.DeepCopy())
+	patch := runtimeclient.MergeFrom(obj.DeepCopy())
 	controllerutil.AddFinalizer(obj, FinalizerSyncController)
 	klog.V(2).Infof("Adding finalizer %s to %s %q", FinalizerSyncController, fedResource.FederatedKind(), fedResource.FederatedName())
 	return s.hostClusterClient.Patch(context.TODO(), obj, patch)
@@ -673,7 +678,7 @@ func (s *KubeFedSyncController) removeFinalizer(fedResource FederatedResource) e
 		return nil
 	}
 
-	patch := client.MergeFrom(obj.DeepCopy())
+	patch := runtimeclient.MergeFrom(obj.DeepCopy())
 	controllerutil.RemoveFinalizer(obj, FinalizerSyncController)
 	klog.V(2).Infof("Removing finalizer %s from %s %q", FinalizerSyncController, fedResource.FederatedKind(), fedResource.FederatedName())
 	return s.hostClusterClient.Patch(context.TODO(), obj, patch)

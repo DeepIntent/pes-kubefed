@@ -22,9 +22,7 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
-
 	corev1 "k8s.io/api/core/v1"
-	pkgruntime "k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/runtime"
 	kubeclientset "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
@@ -33,6 +31,7 @@ import (
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/klog/v2"
+	runtimeclient "sigs.k8s.io/controller-runtime/pkg/client"
 
 	fedv1b1 "sigs.k8s.io/kubefed/pkg/apis/core/v1beta1"
 	"sigs.k8s.io/kubefed/pkg/controller/util"
@@ -105,13 +104,15 @@ func newSchedulingPreferenceController(config *util.ControllerConfig, scheduling
 		eventRecorder:           recorder,
 	}
 
-	s.worker = util.NewReconcileWorker(strings.ToLower(schedulingType.Kind), s.reconcile, util.WorkerTiming{
-		ClusterSyncDelay: s.clusterAvailableDelay,
+	s.worker = util.NewReconcileWorker(strings.ToLower(schedulingType.Kind), s.reconcile, util.WorkerOptions{
+		WorkerTiming: util.WorkerTiming{
+			ClusterSyncDelay: s.clusterAvailableDelay,
+		},
 	})
 
 	eventHandlers := schedulingtypes.SchedulerEventHandlers{
 		KubeFedEventHandler: s.worker.EnqueueObject,
-		ClusterEventHandler: func(obj pkgruntime.Object) {
+		ClusterEventHandler: func(obj runtimeclient.Object) {
 			qualifiedName := util.NewQualifiedName(obj)
 			s.worker.EnqueueForRetry(qualifiedName)
 		},
@@ -187,7 +188,7 @@ func (s *SchedulingPreferenceController) reconcileOnClusterChange() {
 		s.clusterDeliverer.DeliverAt(allClustersKey, nil, time.Now().Add(s.clusterAvailableDelay))
 	}
 	for _, obj := range s.store.List() {
-		qualifiedName := util.NewQualifiedName(obj.(pkgruntime.Object))
+		qualifiedName := util.NewQualifiedName(obj.(runtimeclient.Object))
 		s.worker.EnqueueWithDelay(qualifiedName, s.smallDelay)
 	}
 }
@@ -220,7 +221,7 @@ func (s *SchedulingPreferenceController) reconcile(qualifiedName util.QualifiedN
 	return s.scheduler.Reconcile(obj, qualifiedName)
 }
 
-func (s *SchedulingPreferenceController) objFromCache(store cache.Store, kind, key string) (pkgruntime.Object, error) {
+func (s *SchedulingPreferenceController) objFromCache(store cache.Store, kind, key string) (runtimeclient.Object, error) {
 	cachedObj, exist, err := store.GetByKey(key)
 	if err != nil {
 		wrappedErr := errors.Wrapf(err, "Failed to query store while reconciling RSP controller, triggered by %s named %q", kind, key)
@@ -230,5 +231,5 @@ func (s *SchedulingPreferenceController) objFromCache(store cache.Store, kind, k
 	if !exist {
 		return nil, nil
 	}
-	return cachedObj.(pkgruntime.Object).DeepCopyObject(), nil
+	return cachedObj.(runtimeclient.Object).DeepCopyObject().(runtimeclient.Object), nil
 }
